@@ -63,56 +63,6 @@ class MpesaUssdService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: ""
         Log.d(TAG, "onAccessibilityEvent: type=${event.eventType}, pkg=$pkg")
         serviceScope.launch {
-            val fastRootNode = rootInActiveWindow ?: event?.source
-            if (fastRootNode != null) {
-                val fastText = java.lang.StringBuilder()
-                fun grabText(n: AccessibilityNodeInfo) {
-                    if (n.text != null) fastText.append(n.text).append(" ")
-                    if (n.contentDescription != null) fastText.append(n.contentDescription).append(" ")
-                    for (i in 0 until n.childCount) n.getChild(i)?.let { grabText(it) }
-                }
-                grabText(fastRootNode)
-                val fastDialogText = fastText.toString().lowercase()
-
-                // ── SIM Picker Auto-Bypass ────────────────────────────────────────────
-                // A SIM picker has NO EditText (unlike a USSD menu which always does).
-                // If keyword matched AND no EditText → it's a SIM picker → click SIM 1.
-                val hasNoInput = findEditText(fastRootNode) == null
-                val isNotUssdMenu = !fastDialogText.contains("m-pesa") &&
-                    !fastDialogText.contains("mpesa") &&
-                    !fastDialogText.contains("my account") &&
-                    !fastDialogText.contains("enter pin") &&
-                    !fastDialogText.contains("enter m-pesa")
-
-                // Strategy 1: keyword match + no EditText = definitely SIM picker
-                val keywordMatch = simPickerKeywords.any { fastDialogText.contains(it) }
-                if (keywordMatch && hasNoInput && isNotUssdMenu) {
-                    val clicked = clickFirstSimOption(fastRootNode)
-                    if (clicked) {
-                        Log.d(TAG, "SIM Picker bypassed (keyword+structural) — selected SIM 1")
-                        return@launch
-                    }
-                }
-
-                // Strategy 2: no EditText + exactly 2 clickable leaf items (pure structure)
-                // Only used when keywords don't match (e.g. icon-only SIM picker)
-                if (hasNoInput && isNotUssdMenu) {
-                    val clickable = mutableListOf<AccessibilityNodeInfo>()
-                    collectClickable(fastRootNode, clickable)
-                    val leafCount = clickable.count { n ->
-                        val t = n.text?.toString()?.lowercase() ?: ""
-                        t.isNotEmpty() && !t.contains("cancel")
-                    }
-                    if (leafCount == 2) {
-                        val clicked = clickFirstSimOption(fastRootNode)
-                        if (clicked) {
-                            Log.d(TAG, "SIM Picker bypassed (pure structure, 2 items) — selected SIM 1")
-                            return@launch
-                        }
-                    }
-                }
-            }
-
             delay(1000) // Give the normal USSD dialog time to fully render on screen
 
             val rootNode = rootInActiveWindow ?: event?.source
@@ -132,6 +82,12 @@ class MpesaUssdService : AccessibilityService() {
             val dialogText = allText.toString().lowercase()
             if (dialogText.trim().isEmpty()) return@launch
             
+            // Guard against Screen Recorders capturing our own UI and causing rogue clicks
+            if (dialogText.contains("automator active") || dialogText.contains("start automator")) {
+                Log.d(TAG, "Screen contains Statement App UI. Ignoring to prevent rogue clicks.")
+                return@launch
+            }
+            
             Log.d(TAG, "USSD Dialog text: $dialogText")
             android.util.Log.d(TAG, "RAW TEXT SEEN: $dialogText")
 
@@ -148,6 +104,10 @@ class MpesaUssdService : AccessibilityService() {
             if (inputNode != null && buttonNode != null) {
                 // STANDARD USSD (Input field + Send Button)
                 when {
+                    dialogText.contains("success") || dialogText.contains("received") || dialogText.contains("sent to") || dialogText.contains("accepted") || dialogText.contains("processed") || dialogText.contains("failed") -> {
+                        Log.d(TAG, "Final USSD status received on standard dialog: $dialogText")
+                        clickNode(buttonNode!!)
+                    }
                     dialogText.contains("enter m-pesa pin") || dialogText.contains("enter pin") || (dialogText.contains("pin") && !dialogText.contains("pin manager") && !dialogText.contains("unlock m-pesa pin")) -> {
                         val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
                         val pin = prefs.getString("mpesa_pin", "") ?: ""
@@ -246,6 +206,9 @@ class MpesaUssdService : AccessibilityService() {
                 val hasMaskedEmail = emailPrefix.isNotEmpty() && dialogText.contains(emailPrefix) && dialogText.contains("***")
 
                 val clicked = when {
+                    dialogText.contains("call *334#") || dialogText.contains("call ") || dialogText.contains("select sim") || dialogText.contains("choose sim") -> {
+                        clickFirstSimOption(rootNode)
+                    }
                     dialogText.contains("email") || dialogText.contains("e-mail") || dialogText.contains("enter m-pesa pin") || dialogText.contains("enter pin") || (dialogText.contains("pin") && !dialogText.contains("pin manager") && !dialogText.contains("unlock m-pesa pin")) -> {
                         Log.e(TAG, "Found email/pin prompt but no input field on a list-based menu!")
                         false

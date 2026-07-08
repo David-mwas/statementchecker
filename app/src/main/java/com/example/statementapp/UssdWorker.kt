@@ -7,17 +7,18 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.telecom.TelecomManager
 import androidx.core.content.ContextCompat
-import androidx.work.Worker
+import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class UssdWorker(private val context: Context, workerParams: WorkerParameters) :
-    Worker(context, workerParams) {
+    CoroutineWorker(context, workerParams) {
 
-    override fun doWork(): Result {
+    override suspend fun doWork(): Result {
         val prefs = context.getSharedPreferences("MetricsPrefs", Context.MODE_PRIVATE)
         val securePrefs = context.getSharedPreferences("SecurePrefs", Context.MODE_PRIVATE)
         val currentCount = prefs.getInt("request_count", 0)
@@ -86,7 +87,7 @@ class UssdWorker(private val context: Context, workerParams: WorkerParameters) :
         // ── SMS Inbox Polling — primary detection for Huawei/EMUI ────────────
         // Huawei EMUI blocks SMS_RECEIVED broadcasts to third-party apps.
         // Polling content://sms/inbox is reliable on ALL devices.
-        CoroutineScope(Dispatchers.IO).launch {
+        withContext(Dispatchers.IO) {
             var elapsed = 0
             var handled = false
 
@@ -111,7 +112,7 @@ class UssdWorker(private val context: Context, workerParams: WorkerParameters) :
                             Uri.parse("content://sms/inbox"),
                             arrayOf("address", "body", "date"),
                             "date > ?",
-                            arrayOf(currentTime.toString()),
+                            arrayOf((currentTime - 120_000L).toString()),
                             "date DESC"
                         )
                         cursor?.use {

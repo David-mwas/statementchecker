@@ -780,7 +780,7 @@ fun DashboardScreen() {
                     icon = {
                         when {
                             !isAccessibilityEnabled -> Icon(Icons.Filled.Lock, "Locked")
-                            isAnyRunning -> Icon(Icons.Filled.HourglassEmpty, "Running")
+                            isAnyRunning -> Icon(Icons.Filled.CheckCircle, "Active")
                             else -> Icon(Icons.Filled.PlayArrow, "Start")
                         }
                     },
@@ -788,7 +788,7 @@ fun DashboardScreen() {
                         Text(
                             when {
                                 !isAccessibilityEnabled -> "Setup Required"
-                                isAnyRunning -> "Running..."
+                                isAnyRunning -> "Automator Active"
                                 else -> "Start Automator"
                             },
                             fontWeight = FontWeight.Bold
