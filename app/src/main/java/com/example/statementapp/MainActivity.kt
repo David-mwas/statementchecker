@@ -147,6 +147,21 @@ class MainActivity : ComponentActivity() {
             
             VristoTheme(themeMode = themeMode) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    LaunchedEffect(Unit) {
+                        val perms = mutableListOf(
+                            Manifest.permission.CALL_PHONE,
+                            Manifest.permission.RECEIVE_SMS,
+                            Manifest.permission.READ_SMS,
+                            Manifest.permission.READ_PHONE_STATE
+                        )
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        val missing = perms.filter { ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED }
+                        if (missing.isNotEmpty()) {
+                            requestPermissionLauncher.launch(missing.toTypedArray())
+                        }
+                    }
                     MainApp(
                         onCheckPermissions = { checkAndRequestPermissions() },
                         currentTheme = themeMode,
@@ -1387,6 +1402,57 @@ fun SettingsScreen() {
                 },
                 dismissButton = {
                     androidx.compose.material3.TextButton(onClick = { showResetDialog = false }) { Text("Cancel", color = MaterialTheme.colorScheme.onSurface) }
+                }
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Privacy Policy
+        var showPrivacyDialog by remember { mutableStateOf(false) }
+
+        androidx.compose.material3.TextButton(
+            onClick = { showPrivacyDialog = true },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+        ) {
+            Text("Privacy Policy", fontSize = 14.sp, color = VristoPrimary, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline)
+        }
+
+        if (showPrivacyDialog) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showPrivacyDialog = false },
+                containerColor = MaterialTheme.colorScheme.surface,
+                title = { Text("Privacy Policy", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface) },
+                text = {
+                    Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            "This app uses the Android Accessibility Service to automate USSD menu navigation on your behalf. " +
+                            "It reads the content of the USSD dialogs to determine which options to select and where to input your PIN.",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+                        Text(
+                            "We also require the 'Read SMS' permission to detect when Safaricom sends your statement confirmation.",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+                        Text(
+                            "Data Privacy:\n" +
+                            "• Your M-Pesa PIN and Gmail credentials are encrypted and stored securely on your local device.\n" +
+                            "• The Accessibility Service does not log, record, or transmit any of your screen content to third-party servers.\n" +
+                            "• This app operates entirely offline except when sending emails directly from your own Gmail account to yourself.",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+                    }
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = { showPrivacyDialog = false }) {
+                        Text("I Understand", color = VristoPrimary, fontWeight = FontWeight.Bold)
+                    }
                 }
             )
         }

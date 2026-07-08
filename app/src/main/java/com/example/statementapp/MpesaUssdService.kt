@@ -63,7 +63,7 @@ class MpesaUssdService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: ""
         Log.d(TAG, "onAccessibilityEvent: type=${event.eventType}, pkg=$pkg")
         serviceScope.launch {
-            delay(1000) // Give the normal USSD dialog time to fully render on screen
+            delay(400) // Give the normal USSD dialog time to fully render on screen
 
             val rootNode = rootInActiveWindow ?: event?.source
             if (rootNode == null) {
@@ -97,7 +97,7 @@ class MpesaUssdService : AccessibilityService() {
             }
 
             // Intentional visual delay so the user can see what's happening
-            delay(1500)
+            delay(400)
 
             var actionTaken = true
 
@@ -133,18 +133,18 @@ class MpesaUssdService : AccessibilityService() {
                             val opt = getOption(dialogText, emailPrefix) ?: "1"
                             android.widget.Toast.makeText(applicationContext, "Email step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                             inputText(inputNode!!, opt)
-                            kotlinx.coroutines.delay(200)
+                            kotlinx.coroutines.delay(50)
                             clickNode(buttonNode!!)
                         } else if (dialogText.contains("enter new")) {
                             val opt = getOption(dialogText, "enter new") ?: "2"
                             android.widget.Toast.makeText(applicationContext, "Enter New Email step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                             inputText(inputNode!!, opt)
-                            kotlinx.coroutines.delay(200)
+                            kotlinx.coroutines.delay(50)
                             clickNode(buttonNode!!)
                         } else if (email.isNotEmpty()) {
                             android.widget.Toast.makeText(applicationContext, "Email step. Typing: $email", android.widget.Toast.LENGTH_SHORT).show()
                             inputText(inputNode!!, email)
-                            kotlinx.coroutines.delay(200)
+                            kotlinx.coroutines.delay(50)
                             clickNode(buttonNode!!)
                         } else {
                             Log.e(TAG, "Email not found in storage!")
@@ -155,35 +155,35 @@ class MpesaUssdService : AccessibilityService() {
                         val opt = getOption(dialogText, "12") ?: getOption(dialogText, "year") ?: "6"
                         android.widget.Toast.makeText(applicationContext, "12 Months step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                         inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(200)
+                        kotlinx.coroutines.delay(50)
                         clickNode(buttonNode!!)
                     }
                     dialogText.contains("full") -> {
                         val opt = getOption(dialogText, "full") ?: "1"
                         android.widget.Toast.makeText(applicationContext, "Full Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                         inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(200)
+                        kotlinx.coroutines.delay(50)
                         clickNode(buttonNode!!)
                     }
                     dialogText.contains("request") -> {
                         val opt = getOption(dialogText, "request") ?: "1"
                         android.widget.Toast.makeText(applicationContext, "Request Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                         inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(200)
+                        kotlinx.coroutines.delay(50)
                         clickNode(buttonNode!!)
                     }
                     dialogText.contains("mpesa statement") || dialogText.contains("m-pesa statement") || dialogText.contains("statements") || dialogText.contains("statement") -> {
                         val opt = getOption(dialogText, "m-pesa statement") ?: getOption(dialogText, "mpesa statement") ?: getOption(dialogText, "statement") ?: "3"
                         android.widget.Toast.makeText(applicationContext, "M-PESA Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                         inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(200)
+                        kotlinx.coroutines.delay(50)
                         clickNode(buttonNode!!)
                     }
                     dialogText.contains("my account") || dialogText.contains("account") -> {
                         val opt = getOption(dialogText, "my account") ?: getOption(dialogText, "account") ?: "7"
                         android.widget.Toast.makeText(applicationContext, "My Account step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
                         inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(200)
+                        kotlinx.coroutines.delay(50)
                         clickNode(buttonNode!!)
                     }
                     dialogText.contains("pin") -> {
@@ -191,7 +191,7 @@ class MpesaUssdService : AccessibilityService() {
                         val pin = prefs.getString("pin", "") ?: ""
                         android.widget.Toast.makeText(applicationContext, "PIN step. Typing PIN", android.widget.Toast.LENGTH_SHORT).show()
                         inputText(inputNode!!, pin)
-                        kotlinx.coroutines.delay(200)
+                        kotlinx.coroutines.delay(50)
                         clickNode(buttonNode!!)
                     }
                     else -> {
