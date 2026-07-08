@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">statement app</string>
+    <string name="accessibility_service_description">This service is used to automate USSD menu navigation for M-Pesa statements.</string>
+</resources>
