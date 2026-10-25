@@ -1,60 +1,115 @@
 package com.example.statementapp
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Bundle
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class MpesaUssdService : AccessibilityService() {
 
     private val TAG = "MpesaUssdService"
-    private var lastDialogText = ""
-    private val serviceScope = CoroutineScope(Dispatchers.Main)
+    @Volatile private var lastDialogText = ""
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val eventMutex = Mutex()
 
-    // SIM picker keywords — Kenya carriers + generic OEM labels
-    private val simPickerKeywords = listOf(
-        "sim 1", "sim 2", "sim1", "sim2",
-        "card 1", "card 2", "slot 1", "slot 2",
-        "choose sim", "select sim", "choose a sim", "select a sim",
-        "call with", "make call with", "via sim",
-        "safaricom", "airtel", "telkom", "faiba"
-    )
+    private val sessionClaimReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_CLAIM_USSD_SESSION) return
+            val owner = intent.getStringExtra("owner") ?: return
+            if (owner != packageName) {
+                Log.d(TAG, "Yielding USSD session to $owner")
+                endSession(this@MpesaUssdService)
+            }
+        }
+    }
 
     companion object {
+        const val ACTION_CLAIM_USSD_SESSION = "com.dmwas.ussd.ACTION_CLAIM_USSD_SESSION"
+        private const val PEER_AUTOSENDER_PKG = "com.dmwas.autosendapp"
+
+        @Volatile private var instance: MpesaUssdService? = null
+        @Volatile private var isSessionActiveMem: Boolean = false
+        private val companionScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
         private var sessionTimeoutJob: kotlinx.coroutines.Job? = null
 
-        fun startSession(context: android.content.Context, scope: CoroutineScope) {
-            context.getSharedPreferences("UssdPrefs", android.content.Context.MODE_PRIVATE).edit().putBoolean("isSessionActive", true).apply()
-            sessionTimeoutJob?.cancel()
-            sessionTimeoutJob = scope.launch {
-                delay(300_000L) // 5-minute safety timeout
-                endSession(context)
-                android.util.Log.w("MpesaUssdService", "Session timed out — going dormant")
+        private fun notifyPeerSessionClaimed(context: Context) {
+            try {
+                context.sendBroadcast(
+                    Intent(ACTION_CLAIM_USSD_SESSION).apply {
+                        setPackage(PEER_AUTOSENDER_PKG)
+                        putExtra("owner", context.packageName)
+                    }
+                )
+            } catch (e: Exception) {
+                Log.w("MpesaUssdService", "Failed to broadcast session claim", e)
             }
         }
 
-        fun endSession(context: android.content.Context) {
-            context.getSharedPreferences("UssdPrefs", android.content.Context.MODE_PRIVATE).edit().putBoolean("isSessionActive", false).apply()
+        fun startSession(context: Context, scope: CoroutineScope = companionScope) {
+            instance?.lastDialogText = ""
+            isSessionActiveMem = true
+            context.getSharedPreferences("UssdPrefs", Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("isSessionActive", true)
+                .apply()
+            notifyPeerSessionClaimed(context)
             sessionTimeoutJob?.cancel()
+            sessionTimeoutJob = companionScope.launch {
+                delay(60_000L) // 60-second safety timeout for USSD dialog navigation
+                endSession(context)
+                Log.w("MpesaUssdService", "Session timed out — going dormant")
+            }
+        }
+
+        fun endSession(context: Context) {
+            isSessionActiveMem = false
+            instance?.lastDialogText = ""
+            context.getSharedPreferences("UssdPrefs", Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("isSessionActive", false)
+                .apply()
+            sessionTimeoutJob?.cancel()
+        }
+
+        private fun isSessionActive(context: Context): Boolean {
+            return isSessionActiveMem ||
+                context.getSharedPreferences("UssdPrefs", Context.MODE_PRIVATE).getBoolean("isSessionActive", false)
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        instance = this
+        try {
+            ContextCompat.registerReceiver(
+                this,
+                sessionClaimReceiver,
+                IntentFilter(ACTION_CLAIM_USSD_SESSION),
+                ContextCompat.RECEIVER_EXPORTED
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register sessionClaimReceiver", e)
+        }
         Log.d(TAG, "Service connected — dormant until USSD session starts")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         // Guard 1: Only act during an active USSD session
-        val prefs = getSharedPreferences("UssdPrefs", android.content.Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("isSessionActive", false)) return
+        if (!isSessionActive(this)) return
 
         // Guard 2: Only react to window-state/content changes
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
@@ -63,204 +118,244 @@ class MpesaUssdService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: ""
         Log.d(TAG, "onAccessibilityEvent: type=${event.eventType}, pkg=$pkg")
         serviceScope.launch {
-            delay(400) // Give the normal USSD dialog time to fully render on screen
+            eventMutex.withLock {
+                delay(350) // Give the USSD dialog time to fully render on screen
 
-            val rootNode = rootInActiveWindow ?: event?.source
-            if (rootNode == null) {
-                Log.d(TAG, "rootNode is null")
-                return@launch
-            }
+                if (!isSessionActive(this@MpesaUssdService)) return@withLock
 
-            var inputNode: AccessibilityNodeInfo? = null
-            var buttonNode: AccessibilityNodeInfo? = null
-            val allText = java.lang.StringBuilder()
-            val clickableNodes = mutableListOf<AccessibilityNodeInfo>()
+                val rootNode = rootInActiveWindow ?: event?.source ?: return@withLock
 
-            // Find EditText (Input Field), Button (Send/Reply/OK), clickable items, and collect all text
-            findNodes(rootNode, onInputFound = { inputNode = it }, onButtonFound = { buttonNode = it }, allText = allText, clickableNodes = clickableNodes)
+                var inputNode: AccessibilityNodeInfo? = null
+                var positiveButtonNode: AccessibilityNodeInfo? = null
+                var fallbackButtonNode: AccessibilityNodeInfo? = null
+                var dismissButtonNode: AccessibilityNodeInfo? = null
+                val allText = java.lang.StringBuilder()
+                val clickableNodes = mutableListOf<AccessibilityNodeInfo>()
 
-            val dialogText = allText.toString().lowercase()
-            if (dialogText.trim().isEmpty()) return@launch
-            
-            // Guard against Screen Recorders capturing our own UI and causing rogue clicks
-            if (dialogText.contains("automator active") || dialogText.contains("start automator")) {
-                Log.d(TAG, "Screen contains Statement App UI. Ignoring to prevent rogue clicks.")
-                return@launch
-            }
-            
-            Log.d(TAG, "USSD Dialog text: $dialogText")
-            android.util.Log.d(TAG, "RAW TEXT SEEN: $dialogText")
+                // Find EditText, positive/dismiss buttons, clickable items, and collect non-editable text
+                findNodes(
+                    node = rootNode,
+                    onInputFound = { inputNode = it },
+                    onPositiveButtonFound = { positiveButtonNode = it },
+                    onFallbackButtonFound = { if (fallbackButtonNode == null) fallbackButtonNode = it },
+                    onDismissButtonFound = { if (dismissButtonNode == null) dismissButtonNode = it },
+                    allText = allText,
+                    clickableNodes = clickableNodes
+                )
+                val sendButtonNode = positiveButtonNode ?: fallbackButtonNode
+                val okOrDismissNode = positiveButtonNode ?: fallbackButtonNode ?: dismissButtonNode
 
-            if (dialogText == lastDialogText) {
-                android.util.Log.d(TAG, "Skipping identical dialog text to avoid loop.")
-                return@launch // Avoid looping on the same dialog
-            }
+                val dialogText = allText.toString().lowercase()
+                if (dialogText.trim().isEmpty()) return@withLock
 
-            // Intentional visual delay so the user can see what's happening
-            delay(400)
+                // Guard against Screen Recorders or our own / AutoSender's UI causing rogue clicks
+                if (dialogText.contains("automator active") ||
+                    dialogText.contains("start automator") ||
+                    dialogText.contains("autosender")
+                ) {
+                    Log.d(TAG, "Screen contains App UI. Ignoring to prevent rogue clicks.")
+                    return@withLock
+                }
 
-            var actionTaken = true
+                Log.d(TAG, "USSD Dialog text: $dialogText")
 
-            if (inputNode != null && buttonNode != null) {
-                // STANDARD USSD (Input field + Send Button)
-                when {
-                    dialogText.contains("success") || dialogText.contains("received") || dialogText.contains("sent to") || dialogText.contains("accepted") || dialogText.contains("processed") || dialogText.contains("failed") -> {
-                        Log.d(TAG, "Final USSD status received on standard dialog: $dialogText")
-                        clickNode(buttonNode!!)
-                    }
-                    dialogText.contains("enter m-pesa pin") || dialogText.contains("enter pin") || (dialogText.contains("pin") && !dialogText.contains("pin manager") && !dialogText.contains("unlock m-pesa pin")) -> {
-                        val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
-                        val pin = prefs.getString("mpesa_pin", "") ?: ""
-                        if (pin.isNotEmpty()) {
-                            inputText(inputNode!!, pin)
-                            clickNode(buttonNode!!)
-                        } else {
-                            Log.e(TAG, "PIN not found in storage!")
+                if (dialogText == lastDialogText) {
+                    Log.d(TAG, "Skipping identical dialog text to avoid loop.")
+                    return@withLock
+                }
+
+                delay(300)
+
+                val isFinalMessage = dialogText.contains("success") ||
+                    dialogText.contains("received") ||
+                    dialogText.contains("sent to") ||
+                    dialogText.contains("accepted") ||
+                    dialogText.contains("processed") ||
+                    dialogText.contains("failed") ||
+                    dialogText.contains("unable to process") ||
+                    dialogText.contains("currently underway") ||
+                    dialogText.contains("wrong pin") ||
+                    dialogText.contains("invalid")
+
+                var actionTaken = true
+
+                if (inputNode != null && sendButtonNode != null) {
+                    // STANDARD USSD (Input field + Send Button)
+                    when {
+                        isFinalMessage -> {
+                            Log.d(TAG, "Final USSD status received on standard dialog: $dialogText")
+                            lastDialogText = dialogText
+                            clickNode(okOrDismissNode ?: sendButtonNode)
+                            endSession(this@MpesaUssdService)
+                            return@withLock
+                        }
+                        dialogText.contains("enter m-pesa pin") || dialogText.contains("enter pin") || (dialogText.contains("pin") && !dialogText.contains("pin manager") && !dialogText.contains("unlock m-pesa pin")) -> {
+                            val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
+                            val pin = prefs.getString("mpesa_pin", "") ?: ""
+                            if (pin.isNotEmpty()) {
+                                inputText(inputNode!!, pin)
+                                delay(50)
+                                clickNode(sendButtonNode)
+                            } else {
+                                Log.e(TAG, "PIN not found in storage!")
+                                actionTaken = false
+                            }
+                        }
+                        dialogText.contains("email") || dialogText.contains("e-mail") || dialogText.contains("enter new") -> {
+                            val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
+                            val email = prefs.getString("email", "") ?: ""
+
+                            // Safaricom masks email like "mwas***@gmail.com"
+                            val emailPrefix = if (email.length > 4) email.substring(0, 4).lowercase() else email.lowercase()
+                            val hasMaskedEmail = emailPrefix.isNotEmpty() && dialogText.contains(emailPrefix) && dialogText.contains("***")
+
+                            if (hasMaskedEmail) {
+                                val opt = getOption(dialogText, emailPrefix) ?: "1"
+                                android.widget.Toast.makeText(applicationContext, "Email step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                                inputText(inputNode!!, opt)
+                                delay(50)
+                                clickNode(sendButtonNode)
+                            } else if (dialogText.contains("enter new")) {
+                                val opt = getOption(dialogText, "enter new") ?: "2"
+                                android.widget.Toast.makeText(applicationContext, "Enter New Email step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                                inputText(inputNode!!, opt)
+                                delay(50)
+                                clickNode(sendButtonNode)
+                            } else if (email.isNotEmpty()) {
+                                android.widget.Toast.makeText(applicationContext, "Email step. Typing: $email", android.widget.Toast.LENGTH_SHORT).show()
+                                inputText(inputNode!!, email)
+                                delay(50)
+                                clickNode(sendButtonNode)
+                            } else {
+                                Log.e(TAG, "Email not found in storage!")
+                                actionTaken = false
+                            }
+                        }
+                        dialogText.contains("12 months") || dialogText.contains("12 month") || dialogText.contains("1 year") -> {
+                            val opt = getOption(dialogText, "12") ?: getOption(dialogText, "year") ?: "6"
+                            android.widget.Toast.makeText(applicationContext, "12 Months step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                            inputText(inputNode!!, opt)
+                            delay(50)
+                            clickNode(sendButtonNode)
+                        }
+                        dialogText.contains("full") -> {
+                            val opt = getOption(dialogText, "full") ?: "1"
+                            android.widget.Toast.makeText(applicationContext, "Full Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                            inputText(inputNode!!, opt)
+                            delay(50)
+                            clickNode(sendButtonNode)
+                        }
+                        dialogText.contains("request") -> {
+                            val opt = getOption(dialogText, "request") ?: "1"
+                            android.widget.Toast.makeText(applicationContext, "Request Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                            inputText(inputNode!!, opt)
+                            delay(50)
+                            clickNode(sendButtonNode)
+                        }
+                        dialogText.contains("mpesa statement") || dialogText.contains("m-pesa statement") || dialogText.contains("statements") || dialogText.contains("statement") -> {
+                            val opt = getOption(dialogText, "m-pesa statement") ?: getOption(dialogText, "mpesa statement") ?: getOption(dialogText, "statement") ?: "3"
+                            android.widget.Toast.makeText(applicationContext, "M-PESA Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                            inputText(inputNode!!, opt)
+                            delay(50)
+                            clickNode(sendButtonNode)
+                        }
+                        dialogText.contains("my account") || dialogText.contains("account") -> {
+                            val opt = getOption(dialogText, "my account") ?: getOption(dialogText, "account") ?: "7"
+                            android.widget.Toast.makeText(applicationContext, "My Account step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
+                            inputText(inputNode!!, opt)
+                            delay(50)
+                            clickNode(sendButtonNode)
+                        }
+                        dialogText.contains("pin") -> {
+                            val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
+                            val pin = prefs.getString("mpesa_pin", "") ?: ""
+                            if (pin.isNotEmpty()) {
+                                android.widget.Toast.makeText(applicationContext, "PIN step. Typing PIN", android.widget.Toast.LENGTH_SHORT).show()
+                                inputText(inputNode!!, pin)
+                                delay(50)
+                                clickNode(sendButtonNode)
+                            } else {
+                                actionTaken = false
+                            }
+                        }
+                        else -> {
                             actionTaken = false
                         }
                     }
-                    dialogText.contains("email") || dialogText.contains("e-mail") || dialogText.contains("enter new") -> {
-                        val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
-                        val email = prefs.getString("email", "") ?: ""
-                        
-                        // Safaricom masks email like "mwas***@gmail.com"
-                        // Check if the first few chars of the email appear in the dialog
-                        val emailPrefix = if (email.length > 4) email.substring(0, 4).lowercase() else email.lowercase()
-                        val hasMaskedEmail = emailPrefix.isNotEmpty() && dialogText.contains(emailPrefix) && dialogText.contains("***")
+                } else if (clickableNodes.isNotEmpty()) {
+                    // LIST-BASED USSD (Options are clickable lists)
+                    val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
+                    val email = prefs.getString("email", "") ?: ""
+                    val emailPrefix = if (email.length > 4) email.substring(0, 4).lowercase() else email.lowercase()
+                    val hasMaskedEmail = emailPrefix.isNotEmpty() && dialogText.contains(emailPrefix) && dialogText.contains("***")
 
-                        if (hasMaskedEmail) {
-                            // Find the option number for the masked email. e.g. "1. mwas***@gmail.com"
-                            val opt = getOption(dialogText, emailPrefix) ?: "1"
-                            android.widget.Toast.makeText(applicationContext, "Email step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                            inputText(inputNode!!, opt)
-                            kotlinx.coroutines.delay(50)
-                            clickNode(buttonNode!!)
-                        } else if (dialogText.contains("enter new")) {
-                            val opt = getOption(dialogText, "enter new") ?: "2"
-                            android.widget.Toast.makeText(applicationContext, "Enter New Email step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                            inputText(inputNode!!, opt)
-                            kotlinx.coroutines.delay(50)
-                            clickNode(buttonNode!!)
-                        } else if (email.isNotEmpty()) {
-                            android.widget.Toast.makeText(applicationContext, "Email step. Typing: $email", android.widget.Toast.LENGTH_SHORT).show()
-                            inputText(inputNode!!, email)
-                            kotlinx.coroutines.delay(50)
-                            clickNode(buttonNode!!)
-                        } else {
-                            Log.e(TAG, "Email not found in storage!")
-                            actionTaken = false
+                    val clicked = when {
+                        dialogText.contains("call *334#") || dialogText.contains("call ") || dialogText.contains("select sim") || dialogText.contains("choose sim") -> {
+                            clickFirstSimOption(rootNode)
                         }
+                        dialogText.contains("email") || dialogText.contains("e-mail") || dialogText.contains("enter m-pesa pin") || dialogText.contains("enter pin") || (dialogText.contains("pin") && !dialogText.contains("pin manager") && !dialogText.contains("unlock m-pesa pin")) -> {
+                            Log.e(TAG, "Found email/pin prompt but no input field on a list-based menu!")
+                            false
+                        }
+                        hasMaskedEmail -> clickMatchingNode(clickableNodes, emailPrefix)
+                        dialogText.contains("enter new") -> clickMatchingNode(clickableNodes, "enter new")
+                        dialogText.contains("12 months") || dialogText.contains("1 year") -> {
+                            clickMatchingNode(clickableNodes, "12 months") || clickMatchingNode(clickableNodes, "1 year")
+                        }
+                        dialogText.contains("full statement") || dialogText.contains("full") -> {
+                            clickMatchingNode(clickableNodes, "full statement") || clickMatchingNode(clickableNodes, "full")
+                        }
+                        dialogText.contains("request statement") || dialogText.contains("request") -> {
+                            clickMatchingNode(clickableNodes, "request statement") || clickMatchingNode(clickableNodes, "request")
+                        }
+                        dialogText.contains("mpesa statement") || dialogText.contains("m-pesa statement") || dialogText.contains("statements") -> {
+                            clickMatchingNode(clickableNodes, "m-pesa statement") || clickMatchingNode(clickableNodes, "mpesa statement") || clickMatchingNode(clickableNodes, "statement")
+                        }
+                        dialogText.contains("my account") || dialogText.contains("account") -> {
+                            clickMatchingNode(clickableNodes, "my account") || clickMatchingNode(clickableNodes, "account")
+                        }
+                        else -> false
                     }
-                    dialogText.contains("12 months") || dialogText.contains("12 month") || dialogText.contains("1 year") -> {
-                        val opt = getOption(dialogText, "12") ?: getOption(dialogText, "year") ?: "6"
-                        android.widget.Toast.makeText(applicationContext, "12 Months step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                        inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(50)
-                        clickNode(buttonNode!!)
-                    }
-                    dialogText.contains("full") -> {
-                        val opt = getOption(dialogText, "full") ?: "1"
-                        android.widget.Toast.makeText(applicationContext, "Full Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                        inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(50)
-                        clickNode(buttonNode!!)
-                    }
-                    dialogText.contains("request") -> {
-                        val opt = getOption(dialogText, "request") ?: "1"
-                        android.widget.Toast.makeText(applicationContext, "Request Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                        inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(50)
-                        clickNode(buttonNode!!)
-                    }
-                    dialogText.contains("mpesa statement") || dialogText.contains("m-pesa statement") || dialogText.contains("statements") || dialogText.contains("statement") -> {
-                        val opt = getOption(dialogText, "m-pesa statement") ?: getOption(dialogText, "mpesa statement") ?: getOption(dialogText, "statement") ?: "3"
-                        android.widget.Toast.makeText(applicationContext, "M-PESA Statement step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                        inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(50)
-                        clickNode(buttonNode!!)
-                    }
-                    dialogText.contains("my account") || dialogText.contains("account") -> {
-                        val opt = getOption(dialogText, "my account") ?: getOption(dialogText, "account") ?: "7"
-                        android.widget.Toast.makeText(applicationContext, "My Account step. Typing: $opt", android.widget.Toast.LENGTH_SHORT).show()
-                        inputText(inputNode!!, opt)
-                        kotlinx.coroutines.delay(50)
-                        clickNode(buttonNode!!)
-                    }
-                    dialogText.contains("pin") -> {
-                        val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
-                        val pin = prefs.getString("pin", "") ?: ""
-                        android.widget.Toast.makeText(applicationContext, "PIN step. Typing PIN", android.widget.Toast.LENGTH_SHORT).show()
-                        inputText(inputNode!!, pin)
-                        kotlinx.coroutines.delay(50)
-                        clickNode(buttonNode!!)
-                    }
-                    else -> {
+
+                    // If it's a final message (success/fail) with just an OK button
+                    if (!clicked && okOrDismissNode != null && (isFinalMessage || dialogText.contains("accept") || dialogText.contains("email"))) {
+                        Log.d(TAG, "Final USSD status received: $dialogText")
+                        lastDialogText = dialogText
+                        clickNode(okOrDismissNode)
+                        endSession(this@MpesaUssdService)
+                        return@withLock
+                    } else if (!clicked) {
                         actionTaken = false
                     }
-                }
-            } else if (clickableNodes.isNotEmpty()) {
-                // LIST-BASED USSD (Options are clickable lists)
-                val prefs = getSharedPreferences("SecurePrefs", MODE_PRIVATE)
-                val email = prefs.getString("email", "") ?: ""
-                val emailPrefix = if (email.length > 4) email.substring(0, 4).lowercase() else email.lowercase()
-                val hasMaskedEmail = emailPrefix.isNotEmpty() && dialogText.contains(emailPrefix) && dialogText.contains("***")
-
-                val clicked = when {
-                    dialogText.contains("call *334#") || dialogText.contains("call ") || dialogText.contains("select sim") || dialogText.contains("choose sim") -> {
-                        clickFirstSimOption(rootNode)
+                } else if (okOrDismissNode != null) {
+                    if (isFinalMessage || dialogText.contains("accept") || dialogText.contains("email")) {
+                        Log.d(TAG, "Final USSD status received: $dialogText")
+                        lastDialogText = dialogText
+                        clickNode(okOrDismissNode)
+                        endSession(this@MpesaUssdService)
+                        return@withLock
+                    } else {
+                        actionTaken = false
                     }
-                    dialogText.contains("email") || dialogText.contains("e-mail") || dialogText.contains("enter m-pesa pin") || dialogText.contains("enter pin") || (dialogText.contains("pin") && !dialogText.contains("pin manager") && !dialogText.contains("unlock m-pesa pin")) -> {
-                        Log.e(TAG, "Found email/pin prompt but no input field on a list-based menu!")
-                        false
-                    }
-                    hasMaskedEmail -> clickMatchingNode(clickableNodes, emailPrefix)
-                    dialogText.contains("enter new") -> clickMatchingNode(clickableNodes, "enter new")
-                    dialogText.contains("12 months") || dialogText.contains("1 year") -> {
-                        clickMatchingNode(clickableNodes, "12 months") || clickMatchingNode(clickableNodes, "1 year")
-                    }
-                    dialogText.contains("full statement") || dialogText.contains("full") -> {
-                        clickMatchingNode(clickableNodes, "full statement") || clickMatchingNode(clickableNodes, "full")
-                    }
-                    dialogText.contains("request statement") || dialogText.contains("request") -> {
-                        clickMatchingNode(clickableNodes, "request statement") || clickMatchingNode(clickableNodes, "request")
-                    }
-                    dialogText.contains("mpesa statement") || dialogText.contains("m-pesa statement") || dialogText.contains("statements") -> {
-                        clickMatchingNode(clickableNodes, "m-pesa statement") || clickMatchingNode(clickableNodes, "mpesa statement") || clickMatchingNode(clickableNodes, "statement")
-                    }
-                    dialogText.contains("my account") || dialogText.contains("account") -> {
-                        clickMatchingNode(clickableNodes, "my account") || clickMatchingNode(clickableNodes, "account")
-                    }
-                    else -> false
-                }
-                
-                // If it's a final message (success/fail) with just an OK button
-                if (!clicked && buttonNode != null && (dialogText.contains("success") || dialogText.contains("received") || dialogText.contains("failed") || dialogText.contains("accept") || dialogText.contains("email"))) {
-                    Log.d(TAG, "Final USSD status received: $dialogText")
-                    clickNode(buttonNode!!)
-                } else if (!clicked) {
-                    actionTaken = false
-                }
-            } else if (buttonNode != null) {
-                if (dialogText.contains("success") || dialogText.contains("received") || dialogText.contains("failed") || dialogText.contains("accept") || dialogText.contains("email")) {
-                    Log.d(TAG, "Final USSD status received: $dialogText")
-                    clickNode(buttonNode!!)
                 } else {
+                    Log.d(TAG, "Input or button node missing. Input: $inputNode, Button: $sendButtonNode, Clickable Options: ${clickableNodes.size}")
                     actionTaken = false
                 }
-            } else {
-                Log.d(TAG, "Input or button node missing. Input: $inputNode, Button: $buttonNode, Clickable Options: ${clickableNodes.size}")
-                actionTaken = false
-            }
-            
-            if (actionTaken) {
-                lastDialogText = dialogText
+
+                if (actionTaken) {
+                    lastDialogText = dialogText
+                }
             }
         }
     }
 
     private fun getOption(dialogText: String, keyword: String): String? {
-        val regex = Regex("(\\d+)[^0-9a-zA-Z]*$keyword", RegexOption.IGNORE_CASE)
-        return regex.find(dialogText)?.groupValues?.get(1)
+        val escaped = Regex.escape(keyword)
+        val strictRegex = Regex("(?:^|\\s)([1-9])\\s*[.:)\\-]\\s*[^\\n]*?$escaped", RegexOption.IGNORE_CASE)
+        strictRegex.find(dialogText)?.groupValues?.get(1)?.let { return it }
+
+        val fallbackRegex = Regex("(?:^|\\D)([1-9])[^0-9a-zA-Z]+$escaped", RegexOption.IGNORE_CASE)
+        return fallbackRegex.find(dialogText)?.groupValues?.get(1)
     }
     
     private fun clickMatchingNode(nodes: List<AccessibilityNodeInfo>, keyword: String): Boolean {
@@ -288,42 +383,57 @@ class MpesaUssdService : AccessibilityService() {
     private fun findNodes(
         node: AccessibilityNodeInfo,
         onInputFound: (AccessibilityNodeInfo) -> Unit,
-        onButtonFound: (AccessibilityNodeInfo) -> Unit,
+        onPositiveButtonFound: (AccessibilityNodeInfo) -> Unit,
+        onFallbackButtonFound: (AccessibilityNodeInfo) -> Unit,
+        onDismissButtonFound: (AccessibilityNodeInfo) -> Unit,
         allText: java.lang.StringBuilder,
         clickableNodes: MutableList<AccessibilityNodeInfo>
     ) {
-        if (node.text != null) {
-            allText.append(node.text).append(" ")
+        val isEditText = node.className?.toString() == "android.widget.EditText" || node.isEditable
+        if (!isEditText) {
+            if (node.text != null) {
+                allText.append(node.text).append(" ")
+            }
+            if (node.contentDescription != null) {
+                allText.append(node.contentDescription).append(" ")
+            }
         }
-        if (node.contentDescription != null) {
-            allText.append(node.contentDescription).append(" ")
-        }
-        
+
         if (node.isClickable) {
             clickableNodes.add(node)
         }
-        
-        if (node.className?.toString() == "android.widget.EditText" || node.isEditable) {
+
+        if (isEditText) {
             onInputFound(node)
         } else if (node.className?.toString() == "android.widget.Button") {
-            val text = node.text?.toString()?.lowercase() ?: ""
-            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
-            val isSend = text.contains("send") || text.contains("ok") || text.contains("reply") || text.contains("yes") || text.contains("submit") ||
-                         desc.contains("send") || desc.contains("ok") || desc.contains("reply") || desc.contains("yes") || desc.contains("submit")
-            
-            if (isSend) {
-                onButtonFound(node)
-            } else {
-                // If it's explicitly a Button but has no recognizable text, store it anyway.
-                // We'll use the last one found (usually the positive button on the right).
-                onButtonFound(node)
+            val text = node.text?.toString()?.lowercase()?.trim() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase()?.trim() ?: ""
+            val isPositive = text.contains("send") || text.contains("ok") || text.contains("reply") ||
+                text.contains("yes") || text.contains("submit") || text.contains("accept") ||
+                desc.contains("send") || desc.contains("ok") || desc.contains("reply") ||
+                desc.contains("yes") || desc.contains("submit") || desc.contains("accept")
+            val isCancel = text.contains("cancel") || text.contains("dismiss") || text.contains("no") ||
+                desc.contains("cancel") || desc.contains("dismiss") || desc.contains("no")
+
+            when {
+                isPositive -> onPositiveButtonFound(node)
+                isCancel -> onDismissButtonFound(node)
+                else -> onFallbackButtonFound(node)
             }
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i)
             if (child != null) {
-                findNodes(child, onInputFound, onButtonFound, allText, clickableNodes)
+                findNodes(
+                    node = child,
+                    onInputFound = onInputFound,
+                    onPositiveButtonFound = onPositiveButtonFound,
+                    onFallbackButtonFound = onFallbackButtonFound,
+                    onDismissButtonFound = onDismissButtonFound,
+                    allText = allText,
+                    clickableNodes = clickableNodes
+                )
             }
         }
     }
@@ -418,6 +528,10 @@ class MpesaUssdService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            unregisterReceiver(sessionClaimReceiver)
+        } catch (_: Exception) {}
+        instance = null
         MpesaUssdService.endSession(this)
         serviceScope.cancel()
     }

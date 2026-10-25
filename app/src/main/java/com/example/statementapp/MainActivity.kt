@@ -735,6 +735,7 @@ fun DashboardScreen() {
             FloatingActionButton(onClick = {
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                 workManager.cancelAllWork()
+                MpesaUssdService.endSession(context)
                 context.getSharedPreferences("MetricsPrefs", Context.MODE_PRIVATE).edit().putLong("last_request_time_ms", 0L).apply()
                 Toast.makeText(context, "Automator Stopped", Toast.LENGTH_SHORT).show()
             }, containerColor = VristoDanger, contentColor = Color.White) {
